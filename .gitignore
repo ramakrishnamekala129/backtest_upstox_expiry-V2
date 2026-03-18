@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local secrets and runtime artifacts
+.upstox_access_token.json
+instruments_cache.json
+data/
+output/
+expired_contracts/
+*.duckdb
+*.wal
+*.wal.checkpoint
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
