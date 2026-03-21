@@ -1,0 +1,26 @@
+{
+  "name": "TrendDates Analytics",
+  "short_name": "TrendDates",
+  "description": "Stock trend date explorer with month-based filtering and summaries.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#06131a",
+  "theme_color": "#06131a",
+  "lang": "en-US",
+  "icons": [
+    {
+      "src": "/icons/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

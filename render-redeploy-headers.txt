@@ -1,0 +1,19 @@
+HTTP/1.1 202 Accepted
+Date: Sat, 21 Mar 2026 11:59:42 GMT
+Content-Length: 0
+Connection: keep-alive
+CF-RAY: 9dfccabf18e34561-BOM
+ratelimit-limit: 10
+ratelimit-remaining: 9
+ratelimit-reset: 17
+referrer-policy: same-origin
+render-request-id: api-558b47f64-xksfk/xN5Hku7zct-3160529
+strict-transport-security: max-age=315360000; includeSubDomains; preload
+vary: Origin
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+cf-cache-status: DYNAMIC
+Server: cloudflare
+alt-svc: h3=":443"; ma=86400
+

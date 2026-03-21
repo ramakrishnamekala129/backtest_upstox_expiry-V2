@@ -1,0 +1,32 @@
+# Build/cache outputs
+.next
+node_modules
+
+# Local/dev artifacts
+.git
+.gitignore
+*.log
+*.pid
+*.zip
+
+# Python and local data assets not needed for Next deploy
+__pycache__
+*.pyc
+excel_output
+*.pkl
+download_state.json
+trendatestocks_*.py
+
+# Mobile/Android and Gradle caches (very large)
+.g
+mobile_table_viewer
+mobile_table_viewer 
+cmdline-tools-tmp
+
+# Agent/tooling metadata
+.agent
+.agents
+.claude
+.trae
+skills-lock.json
+plan.md

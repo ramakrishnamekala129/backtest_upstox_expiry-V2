@@ -1,0 +1,27 @@
+{
+  "type": "web_service",
+  "name": "backtest-upstox-expiry-v3",
+  "ownerId": "tea-d6qfcfma2pns739vpsng",
+  "repo": "https://github.com/ramakrishnamekala129/backtest_upstox_expiry-V2.git",
+  "branch": "backup/current-work-2026-03-21",
+  "autoDeploy": "yes",
+  "rootDir": "",
+  "envVars": [
+    { "key": "PORT", "value": "10000" },
+    { "key": "GENERATED_TREND_JSON_PATH", "value": "data/trend_tables.json" }
+  ],
+  "serviceDetails": {
+    "runtime": "docker",
+    "plan": "free",
+    "region": "oregon",
+    "numInstances": 1,
+    "healthCheckPath": "/api/auth/session",
+    "envSpecificDetails": {
+      "dockerContext": ".",
+      "dockerfilePath": "./Dockerfile"
+    },
+    "previews": {
+      "generation": "off"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+HTTP/1.1 201 Created
+Date: Sat, 21 Mar 2026 11:56:53 GMT
+Content-Type: application/json; charset=utf-8
+Content-Length: 1219
+Connection: keep-alive
+CF-RAY: 9dfcc696f97e054c-BOM
+ratelimit-limit: 20
+ratelimit-remaining: 19
+ratelimit-reset: 188
+referrer-policy: same-origin
+render-request-id: api-558b47f64-xksfk/xN5Hku7zct-3155767
+strict-transport-security: max-age=315360000; includeSubDomains; preload
+vary: Origin
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+cf-cache-status: DYNAMIC
+Server: cloudflare
+alt-svc: h3=":443"; ma=86400
+
