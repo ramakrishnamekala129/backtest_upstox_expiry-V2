@@ -36,7 +36,6 @@ from upstox_tools.astro_service import (
 )
 from upstox_tools.config import UPSTOX_BASE
 from upstox_tools.expired_contracts import EXPIRED_CACHE_ROOT, collect_expired_contracts, fetch_expired_candle
-from upstox_tools.auth import login_upstox, get_access_token
 from upstox_tools.supabase_auth import (
     ACCESS_COOKIE,
     REFRESH_COOKIE,
@@ -245,6 +244,8 @@ def refresh_access_token() -> Optional[str]:
             return _read_token()
         LAST_REFRESH_TS = now
     try:
+        from upstox_tools.auth import get_access_token, login_upstox
+
         code = asyncio.run(login_upstox())
         token = get_access_token(code)
         if not token:
