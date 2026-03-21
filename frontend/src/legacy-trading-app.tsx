@@ -3154,7 +3154,15 @@ export function LegacyTradingApp() {
                     <button
                       type="button"
                       className={terminalFilterButton(false)}
-                      onClick={() => setOhlcLogLines([])}
+                      onClick={async () => {
+                        try {
+                          await fetch("/api/ohlc-log/clear", { method: "POST" });
+                        } catch {
+                          // Ignore refresh errors and still clear the local buffer.
+                        }
+                        setOhlcLogLines([]);
+                        setTerminalRefreshTick(prev => prev + 1);
+                      }}
                     >
                       Clear
                     </button>

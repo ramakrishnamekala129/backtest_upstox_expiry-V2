@@ -1,13 +1,8 @@
 from urllib.parse import parse_qs, urlparse
 
-import nest_asyncio
-import pyotp
 import requests
-from playwright.async_api import async_playwright
 
 from .config import AUTH_URL, MOBILE_NO, PIN, RURL, SECRET_KEY, API_KEY, TOTP_KEY
-
-nest_asyncio.apply()
 
 
 async def login_upstox(
@@ -17,6 +12,13 @@ async def login_upstox(
     pin: str = PIN,
 ):
     """Perform the browser-based login flow and return the authorization code."""
+    try:
+        import pyotp
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            'Upstox browser login dependencies are unavailable. Install pyotp and playwright to enable local login.'
+        ) from exc
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)

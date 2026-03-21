@@ -52,6 +52,8 @@ from upstox_tools.trend_data import load_trend_payload
 logger = logging.getLogger(__name__)
 app = FastAPI(title='Expired Contracts Portal')
 IS_VERCEL = bool(os.getenv('VERCEL'))
+IS_RENDER = bool(os.getenv('RENDER'))
+IS_CLOUD_DEPLOYMENT = IS_VERCEL or IS_RENDER
 RUNTIME_ROOT = Path('/tmp/backtest_upstox_expiry_v3') if IS_VERCEL else Path('.')
 TOKEN_CACHE = Path.home() / '.upstox_access_token.json'
 TOKEN_REFRESH_LOCK = Lock()
@@ -205,6 +207,9 @@ async def handle_supabase_auth_error(_: Request, exc: SupabaseAuthError):
 
 
 def _read_token() -> Optional[str]:
+    env_token = os.getenv('UPSTOX_ACCESS_TOKEN', '').strip()
+    if env_token:
+        return env_token
     try:
         payload = json.loads(TOKEN_CACHE.read_text(encoding='utf-8'))
     except (FileNotFoundError, json.JSONDecodeError):
@@ -243,6 +248,15 @@ def refresh_access_token() -> Optional[str]:
         if now - LAST_REFRESH_TS < 60:
             return _read_token()
         LAST_REFRESH_TS = now
+    if IS_CLOUD_DEPLOYMENT:
+        LAST_REFRESH_STATUS.update(
+            {
+                'status': 'refresh_unavailable',
+                'message': 'Automatic Upstox browser login is disabled on cloud deployments. Set UPSTOX_ACCESS_TOKEN.',
+                'last_refresh_ts': LAST_REFRESH_TS,
+            }
+        )
+        return None
     try:
         from upstox_tools.auth import get_access_token, login_upstox
 
@@ -1006,6 +1020,11 @@ def _tail_log(path: Path, limit: int = 200) -> List[str]:
         return []
     lines = path.read_text(encoding='utf-8').splitlines()
     return lines[-limit:]
+
+
+def _clear_log(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('', encoding='utf-8')
 
 
 async def _run_ohlc_job(
@@ -2170,6 +2189,13 @@ def control_ohlc_job(job_id: str, action: str = Query(...)):
 @app.get('/api/ohlc-log')
 def get_ohlc_log(limit: int = Query(200, ge=1, le=1000)):
     return JSONResponse({'lines': _tail_log(LOG_PATH, limit)})
+
+
+@app.post('/api/ohlc-log/clear')
+def clear_ohlc_log():
+    _clear_log(LOG_PATH)
+    logger.info('OHLC backend log cleared by user request.')
+    return JSONResponse({'status': 'cleared'})
 
 
 @app.get('/api/token-status')
