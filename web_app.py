@@ -78,6 +78,7 @@ MASTER_INDEX_PARQUET = PARQUET_ROOT / 'expired_candles_index.parquet'
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 PARQUET_ROOT.mkdir(parents=True, exist_ok=True)
 JOB_DB_ROOT.mkdir(parents=True, exist_ok=True)
+EXPIRED_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 if not logger.handlers:
     file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
     formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
@@ -1343,6 +1344,9 @@ async def _run_ohlc_job(
 
 
 def _load_snapshot(instrument_key: str) -> Optional[dict]:
+    if not EXPIRED_CACHE_ROOT.exists():
+        EXPIRED_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        return None
     for entry in EXPIRED_CACHE_ROOT.iterdir():
         if not entry.is_dir():
             continue
