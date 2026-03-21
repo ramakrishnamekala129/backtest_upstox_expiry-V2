@@ -16,11 +16,15 @@ def _candidate_paths() -> list[Path]:
         os.getenv("GENERATED_TREND_JSON_PATH", "").strip() or "data/trend_tables.json"
     )
     env_path = os.getenv("TREND_JSON_PATH", "").strip()
-    fallback = Path("async_trend_UI") / "public" / "trend_tables.json"
+    fallbacks = (
+        Path("frontend") / "public" / "trend_tables.json",
+        Path("frontend") / "dist" / "trend_tables.json",
+        Path("async_trend_UI") / "public" / "trend_tables.json",
+    )
     paths: list[Path] = [generated]
     if env_path:
         paths.append(Path(env_path))
-    paths.append(fallback)
+    paths.extend(fallbacks)
     deduped: list[Path] = []
     seen: set[str] = set()
     for path in paths:
@@ -54,7 +58,9 @@ def _unwrap_payload(value: Any) -> TrendPayload | None:
 def load_trend_payload() -> Tuple[str, TrendPayload]:
     failures: list[str] = []
 
-    for path in _candidate_paths():
+    generated_path, *fallback_paths = _candidate_paths()
+
+    for path in [generated_path]:
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -82,6 +88,21 @@ def load_trend_payload() -> Tuple[str, TrendPayload]:
         except requests.RequestException as exc:
             failures.append(f"TREND_DATA_URL: {exc}")
 
+    for path in fallback_paths:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            failures.append(f"{path}: {exc}")
+            continue
+        payload = _unwrap_payload(data)
+        if payload is not None:
+            return (str(path), payload)
+        failures.append(f"{path}: invalid trend payload shape")
+
     joined = " | ".join(failures) if failures else "No trend sources configured."
     raise RuntimeError(f"Unable to load trend data. {joined}")
-
