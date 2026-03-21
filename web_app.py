@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from datetime import date, datetime, timedelta
 import calendar
@@ -15,24 +16,44 @@ import time
 import asyncio
 import pyarrow as pa
 import pyarrow.parquet as pq
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import click
 import duckdb
 import httpx
 import requests
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from upstox_tools.backtest import _load_instruments_cache
+from upstox_tools.astro_service import (
+    build_astro_payload,
+    build_moon_ascendant_payload,
+    build_planetary_aspects_payload,
+)
 from upstox_tools.config import UPSTOX_BASE
 from upstox_tools.expired_contracts import EXPIRED_CACHE_ROOT, collect_expired_contracts, fetch_expired_candle
 from upstox_tools.auth import login_upstox, get_access_token
+from upstox_tools.supabase_auth import (
+    ACCESS_COOKIE,
+    REFRESH_COOKIE,
+    SupabaseAuthError,
+    get_user as get_supabase_user,
+    is_supabase_configured,
+    load_supabase_config,
+    refresh_session as refresh_supabase_session,
+    sign_in_with_password,
+    sign_up_user,
+)
+from upstox_tools.trend_data import load_trend_payload
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title='Expired Contracts Portal')
+IS_VERCEL = bool(os.getenv('VERCEL'))
+RUNTIME_ROOT = Path('/tmp/backtest_upstox_expiry_v3') if IS_VERCEL else Path('.')
 TOKEN_CACHE = Path.home() / '.upstox_access_token.json'
 TOKEN_REFRESH_LOCK = Lock()
 LAST_REFRESH_TS = 0.0
@@ -43,7 +64,7 @@ LAST_UPSTOX_REQUEST_TS = 0.0
 MIN_UPSTOX_REQUEST_GAP_SECONDS = 0.15
 OHLC_FETCH_MAX_WORKERS = 4
 OHLC_EXPIRY_DISCOVERY_MAX_CONCURRENCY = 6
-DATA_ROOT = Path('data')
+DATA_ROOT = RUNTIME_ROOT / 'data'
 PARQUET_ROOT = DATA_ROOT / 'parquet'
 DB_PATH = DATA_ROOT / 'expired_data.duckdb'
 FRONTEND_DIST = Path('frontend') / 'dist'
@@ -54,6 +75,8 @@ MASTER_CANDLES_PARQUET = PARQUET_ROOT / 'expired_candles_master.parquet'
 MASTER_INDEX_PARQUET = PARQUET_ROOT / 'expired_candles_index.parquet'
 
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
+PARQUET_ROOT.mkdir(parents=True, exist_ok=True)
+JOB_DB_ROOT.mkdir(parents=True, exist_ok=True)
 if not logger.handlers:
     file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
     formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
@@ -81,6 +104,105 @@ for _wal_ext in ('.wal', '.wal.checkpoint'):
 
 if FRONTEND_ASSETS.exists():
     app.mount('/assets', StaticFiles(directory=FRONTEND_ASSETS), name='assets')
+
+
+def _is_public_path(path: str) -> bool:
+    if path in {'/auth/sign-in', '/auth/sign-up', '/auth/callback', '/sign-in', '/sign-up'}:
+        return True
+    return path.startswith('/assets/') or path in {'/favicon.ico'}
+
+
+def _is_api_path(path: str) -> bool:
+    return path.startswith('/api/') or path.startswith('/download/')
+
+
+def _set_session_cookies(response: Response, session: Dict[str, Any]) -> None:
+    config = load_supabase_config()
+    secure = config.secure_cookies if config else False
+    max_age = int(session.get('expires_in') or 60 * 60 * 24 * 7)
+    access_token = str(session.get('access_token') or '').strip()
+    refresh_token = str(session.get('refresh_token') or '').strip()
+    if access_token:
+        response.set_cookie(
+            ACCESS_COOKIE,
+            access_token,
+            httponly=True,
+            secure=secure,
+            samesite='lax',
+            max_age=max_age,
+            path='/',
+        )
+    if refresh_token:
+        response.set_cookie(
+            REFRESH_COOKIE,
+            refresh_token,
+            httponly=True,
+            secure=secure,
+            samesite='lax',
+            max_age=60 * 60 * 24 * 30,
+            path='/',
+        )
+
+
+def _clear_session_cookies(response: Response) -> None:
+    response.delete_cookie(ACCESS_COOKIE, path='/')
+    response.delete_cookie(REFRESH_COOKIE, path='/')
+
+
+def _resolve_authenticated_user(request: Request) -> Optional[Dict[str, Any]]:
+    if not is_supabase_configured():
+        user = {'email': 'local@offline', 'id': 'local-session', 'user_metadata': {'username': 'local'}}
+        request.state.supabase_user = user
+        request.state.supabase_session = None
+        return user
+    access_token = request.cookies.get(ACCESS_COOKIE)
+    refresh_token = request.cookies.get(REFRESH_COOKIE)
+    refreshed_session: Optional[Dict[str, Any]] = None
+    user: Optional[Dict[str, Any]] = None
+    if access_token:
+        try:
+            user = get_supabase_user(access_token)
+        except SupabaseAuthError:
+            user = None
+    if user is None and refresh_token:
+        try:
+            refreshed_session = refresh_supabase_session(refresh_token)
+            access_token = str(refreshed_session.get('access_token') or '')
+            if access_token:
+                user = get_supabase_user(access_token)
+        except SupabaseAuthError:
+            user = None
+            refreshed_session = None
+    if user is None:
+        return None
+    request.state.supabase_user = user
+    request.state.supabase_session = refreshed_session
+    return user
+
+
+class SupabaseSessionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if _is_public_path(path):
+            return await call_next(request)
+        user = _resolve_authenticated_user(request)
+        if user is None:
+            if _is_api_path(path):
+                return JSONResponse({'detail': 'Authentication required'}, status_code=401)
+            return RedirectResponse(url='/sign-in', status_code=303)
+        response = await call_next(request)
+        refreshed_session = getattr(request.state, 'supabase_session', None)
+        if refreshed_session:
+            _set_session_cookies(response, refreshed_session)
+        return response
+
+
+app.add_middleware(SupabaseSessionMiddleware)
+
+
+@app.exception_handler(SupabaseAuthError)
+async def handle_supabase_auth_error(_: Request, exc: SupabaseAuthError):
+    return JSONResponse({'detail': str(exc)}, status_code=400)
 
 
 def _read_token() -> Optional[str]:
@@ -1723,6 +1845,162 @@ def _candles_already_stored(
             [instrument_key, interval, from_date, to_date],
         ).fetchone()[0]
         return count > 0
+
+
+@app.post('/auth/sign-in')
+async def auth_sign_in(request: Request):
+    payload = await request.json()
+    email = str(payload.get('email') or '').strip()
+    password = str(payload.get('password') or '').strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail='Email and password are required.')
+    session = sign_in_with_password(email, password)
+    user = get_supabase_user(str(session.get('access_token') or ''))
+    response = JSONResponse(
+        {
+            'status': 'ok',
+            'user': {
+                'id': user.get('id'),
+                'email': user.get('email'),
+                'user_metadata': user.get('user_metadata') or {},
+            },
+        }
+    )
+    _set_session_cookies(response, session)
+    return response
+
+
+@app.post('/auth/sign-up')
+async def auth_sign_up(request: Request):
+    payload = await request.json()
+    email = str(payload.get('email') or '').strip()
+    password = str(payload.get('password') or '').strip()
+    username = str(payload.get('username') or '').strip()
+    full_name = str(payload.get('full_name') or '').strip()
+    phone_number = str(payload.get('phone_number') or '').strip()
+    country = str(payload.get('country') or '').strip() or 'IN'
+    if not email or not password or not username:
+        raise HTTPException(status_code=400, detail='Email, password, and username are required.')
+    result = sign_up_user(
+        email=email,
+        password=password,
+        username=username,
+        full_name=full_name,
+        phone_number=phone_number,
+        country=country,
+    )
+    session = result.get('session') or {}
+    response = JSONResponse(
+        {
+            'status': 'ok',
+            'message': 'Account created. Check your email if confirmation is enabled.',
+            'user': result.get('user'),
+        }
+    )
+    if isinstance(session, dict) and session.get('access_token'):
+        _set_session_cookies(response, session)
+    return response
+
+
+@app.post('/auth/sign-out')
+def auth_sign_out():
+    response = JSONResponse({'status': 'signed_out'})
+    _clear_session_cookies(response)
+    return response
+
+
+@app.get('/auth/callback')
+def auth_callback():
+    return RedirectResponse(url='/sign-in?message=Email confirmed. Please sign in.', status_code=303)
+
+
+@app.get('/api/auth/session')
+def auth_session(request: Request):
+    user = getattr(request.state, 'supabase_user', None)
+    if not user:
+        raise HTTPException(status_code=401, detail='Authentication required')
+    return JSONResponse(
+        {
+            'user': {
+                'id': user.get('id'),
+                'email': user.get('email'),
+                'user_metadata': user.get('user_metadata') or {},
+            }
+        }
+    )
+
+
+@app.get('/api/trends')
+def get_trends(date_key: Optional[str] = Query(None)):
+    source, payload = load_trend_payload()
+    if date_key:
+        rows = payload.get('dates_wise_table', {}).get(date_key, [])
+        return JSONResponse({'source': source, 'date': date_key, 'rows': rows})
+    return JSONResponse({'source': source, 'payload': payload})
+
+
+@app.get('/api/astro')
+def get_astro(
+    date: str = Query(...),
+    time: str = Query(...),
+    symbol: str = Query('NIFTY'),
+    referencePrice: float = Query(...),
+):
+    if len(date) != 10:
+        raise HTTPException(status_code=400, detail='date must use YYYY-MM-DD')
+    if len(time) != 5:
+        raise HTTPException(status_code=400, detail='time must use HH:MM')
+    return JSONResponse({'payload': build_astro_payload(date, time, symbol, referencePrice)})
+
+
+@app.get('/api/astro/planetary-aspects')
+def get_planetary_aspects(
+    startDate: str = Query(...),
+    endDate: str = Query(...),
+    moonMode: str = Query('exclude_moon_ascendant'),
+    planet1: str = Query(''),
+    planet2: str = Query(''),
+    aspects: str = Query(''),
+    orb: float = Query(1.0),
+    maxRows: int = Query(12000, ge=1, le=50000),
+):
+    selected_aspects = [float(item) for item in aspects.split(',') if item.strip()]
+    payload = build_planetary_aspects_payload(
+        start_date=startDate,
+        end_date=endDate,
+        moon_mode=moonMode,
+        planet1=[item.strip() for item in planet1.split(',') if item.strip()],
+        planet2=[item.strip() for item in planet2.split(',') if item.strip()],
+        selected_aspects=selected_aspects,
+        orb=orb,
+        max_rows=maxRows,
+    )
+    return JSONResponse({'payload': payload})
+
+
+@app.get('/api/astro/moon-ascendant')
+def get_moon_ascendant(
+    startDate: str = Query(...),
+    endDate: str = Query(...),
+    includeMoon: bool = Query(True),
+    includeAsc: bool = Query(True),
+    moonTarget: float = Query(0.0),
+    ascTarget: float = Query(0.0),
+    tolerance: float = Query(0.1),
+):
+    try:
+        payload = build_moon_ascendant_payload(
+            start_date=startDate,
+            end_date=endDate,
+            include_moon=includeMoon,
+            include_asc=includeAsc,
+            moon_target=moonTarget,
+            asc_target=ascTarget,
+            tolerance=tolerance,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse({'payload': payload})
 
 
 @app.get('/', response_class=HTMLResponse)

@@ -1,6 +1,9 @@
 click>=8.1
 duckdb>=1.1
 fastapi>=0.115
+httpx>=0.28
 pyarrow>=17.0
+pyswisseph>=2.10
+pytz>=2024.2
 requests>=2.32
 uvicorn[standard]>=0.30

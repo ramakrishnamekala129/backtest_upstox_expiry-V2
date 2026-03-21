@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: backtest-upstox-expiry-v3
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/auth/session
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: SITE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: TREND_DATA_URL
+        sync: false
+      - key: TREND_JSON_PATH
+        sync: false
+      - key: GENERATED_TREND_JSON_PATH
+        value: data/trend_tables.json
+      - key: UPSTOX_API_KEY
+        sync: false
+      - key: UPSTOX_SECRET_KEY
+        sync: false
+      - key: UPSTOX_TOTP_KEY
+        sync: false
+      - key: UPSTOX_MOBILE_NO
+        sync: false
+      - key: UPSTOX_PIN
+        sync: false
