@@ -2202,10 +2202,10 @@ def clear_ohlc_log():
 def get_token_status():
     token = _read_token()
     if not token:
-        return JSONResponse({'status': 'invalid', 'message': 'Token file missing or empty', **LAST_REFRESH_STATUS})
+        return JSONResponse({**LAST_REFRESH_STATUS, 'status': 'invalid', 'message': 'Token file missing or empty'})
     if _is_token_valid(token):
-        return JSONResponse({'status': 'valid', 'message': 'Token valid', **LAST_REFRESH_STATUS})
-    return JSONResponse({'status': 'invalid', 'message': 'Token invalid', **LAST_REFRESH_STATUS})
+        return JSONResponse({**LAST_REFRESH_STATUS, 'status': 'valid', 'message': 'Token valid'})
+    return JSONResponse({**LAST_REFRESH_STATUS, 'status': 'invalid', 'message': 'Token invalid'})
 
 
 @app.post('/api/export-parquet')
