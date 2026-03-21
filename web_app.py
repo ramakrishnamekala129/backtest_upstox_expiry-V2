@@ -1231,12 +1231,14 @@ async def _run_ohlc_job(
                 async with fetch_semaphore:
                     return await _fetch_one(key, instrument_type, range_from, range_to)
 
-            fetch_tasks = {
-                asyncio.create_task(_fetch_with_semaphore(key, instrument_type, range_from, range_to)): (key, range_from, range_to)
+            fetch_tasks = [
+                asyncio.create_task(_fetch_with_semaphore(key, instrument_type, range_from, range_to))
                 for key, instrument_type, range_from, range_to in keys_to_fetch
-            }
+            ]
             for task in asyncio.as_completed(fetch_tasks):
-                instrument_key, range_from, range_to = fetch_tasks[task]
+                instrument_key = ''
+                range_from = ''
+                range_to = ''
                 error_detail = ''
                 data: Optional[List[List[object]]] = None
                 try:
