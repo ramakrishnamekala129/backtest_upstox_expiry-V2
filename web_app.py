@@ -248,15 +248,6 @@ def refresh_access_token() -> Optional[str]:
         if now - LAST_REFRESH_TS < 60:
             return _read_token()
         LAST_REFRESH_TS = now
-    if IS_CLOUD_DEPLOYMENT:
-        LAST_REFRESH_STATUS.update(
-            {
-                'status': 'refresh_unavailable',
-                'message': 'Automatic Upstox browser login is disabled on cloud deployments. Set UPSTOX_ACCESS_TOKEN.',
-                'last_refresh_ts': LAST_REFRESH_TS,
-            }
-        )
-        return None
     try:
         from upstox_tools.auth import get_access_token, login_upstox
 
