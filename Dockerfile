@@ -25,7 +25,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY web_app.py ./
 COPY upstox_tools ./upstox_tools
 COPY docs ./docs
-COPY .env.example ./
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 EXPOSE 10000
