@@ -1,13 +1,14 @@
+import os
 from pathlib import Path
 from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-API_KEY = 'a24f3517-a6d8-4622-916f-bc664f9b32fe'
-SECRET_KEY = '2q1gqkdxx0'
-TOTP_KEY = 'YV4SSJZEI2PD4QAKCEAYIHC4NZ2PJ6GI'
-MOBILE_NO = '6353854816'
-PIN = '260999'
+API_KEY = os.environ.get('UPSTOX_API_KEY', '')
+SECRET_KEY = os.environ.get('UPSTOX_SECRET_KEY', '')
+TOTP_KEY = os.environ.get('UPSTOX_TOTP_KEY', '')
+MOBILE_NO = os.environ.get('UPSTOX_MOBILE_NO', '')
+PIN = os.environ.get('UPSTOX_PIN', '')
 
 RURL = 'https://127.0.0.1:5000/'
 AUTH_URL = (

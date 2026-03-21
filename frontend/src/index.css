@@ -4,22 +4,67 @@
 
 @layer base {
   :root {
-    --background: 210 20% 98%;
-    --foreground: 220 18% 16%;
-    --primary: 217 76% 46%;
+    --background: 227 38% 8%;
+    --foreground: 214 32% 95%;
+    --primary: 224 93% 64%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 210 20% 94%;
-    --secondary-foreground: 220 18% 16%;
-    --muted: 210 20% 94%;
-    --muted-foreground: 215 12% 45%;
-    --accent: 210 20% 94%;
-    --accent-foreground: 220 18% 16%;
-    --destructive: 0 72% 50%;
+    --secondary: 224 24% 16%;
+    --secondary-foreground: 214 32% 95%;
+    --muted: 225 26% 14%;
+    --muted-foreground: 218 18% 68%;
+    --accent: 190 92% 56%;
+    --accent-foreground: 224 44% 12%;
+    --destructive: 0 78% 62%;
     --destructive-foreground: 0 0% 100%;
-    --border: 214 20% 85%;
-    --input: 214 20% 85%;
-    --ring: 217 76% 46%;
-    --radius: 0.75rem;
+    --border: 225 22% 22%;
+    --input: 225 22% 22%;
+    --ring: 224 93% 64%;
+    --radius: 1rem;
   }
 
+  .theme-light {
+    --background: 210 20% 98%;
+    --foreground: 220 22% 13%;
+    --primary: 224 90% 58%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 20% 95%;
+    --secondary-foreground: 220 22% 13%;
+    --muted: 220 20% 95%;
+    --muted-foreground: 220 12% 42%;
+    --accent: 190 70% 44%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 218 18% 86%;
+    --input: 218 18% 86%;
+    --ring: 224 90% 58%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  html.theme-light {
+    color-scheme: light;
+  }
+
+  body {
+    @apply min-h-dvh bg-background text-foreground antialiased;
+    background-image:
+      radial-gradient(circle at top left, rgba(59, 130, 246, 0.18), transparent 28%),
+      radial-gradient(circle at top right, rgba(14, 165, 233, 0.12), transparent 22%),
+      linear-gradient(180deg, rgba(10, 14, 30, 0.96), rgba(7, 10, 20, 1));
+    font-family: Inter, "SF Pro Display", "Segoe UI", sans-serif;
+  }
+
+  html.theme-light body {
+    background-image:
+      radial-gradient(circle at top left, rgba(59, 130, 246, 0.12), transparent 24%),
+      radial-gradient(circle at top right, rgba(14, 165, 233, 0.1), transparent 18%),
+      linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(237, 242, 255, 1));
+  }
 }

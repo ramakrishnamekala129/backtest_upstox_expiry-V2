@@ -9,6 +9,9 @@ venv/
 
 # Local secrets and runtime artifacts
 .upstox_access_token.json
+.env
+.env.*
+!.env.example
 instruments_cache.json
 data/
 output/
@@ -26,3 +29,13 @@ frontend/dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local agent/tooling state
+.agent/
+.agents/
+.claude/
+.kiro/
+*.log
+server.err.log
+server.out.log
+skills-lock.json

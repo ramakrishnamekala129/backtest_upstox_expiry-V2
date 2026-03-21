@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from datetime import date, datetime, timedelta
 import calendar
+import random
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -18,6 +19,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import click
 import duckdb
+import httpx
 import requests
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
@@ -35,6 +37,12 @@ TOKEN_CACHE = Path.home() / '.upstox_access_token.json'
 TOKEN_REFRESH_LOCK = Lock()
 LAST_REFRESH_TS = 0.0
 LAST_REFRESH_STATUS: Dict[str, object] = {'status': 'unknown', 'message': '', 'last_refresh_ts': 0.0}
+UPSTOX_REQUEST_LOCK = Lock()
+ASYNC_UPSTOX_REQUEST_LOCK: Optional[asyncio.Lock] = None
+LAST_UPSTOX_REQUEST_TS = 0.0
+MIN_UPSTOX_REQUEST_GAP_SECONDS = 0.15
+OHLC_FETCH_MAX_WORKERS = 4
+OHLC_EXPIRY_DISCOVERY_MAX_CONCURRENCY = 6
 DATA_ROOT = Path('data')
 PARQUET_ROOT = DATA_ROOT / 'parquet'
 DB_PATH = DATA_ROOT / 'expired_data.duckdb'
@@ -389,6 +397,22 @@ def _update_job(job_id: str, **updates: object) -> None:
         job.update(updates)
 
 
+def _get_job_snapshot(job_id: str) -> Optional[Dict[str, object]]:
+    with OHLC_JOBS_LOCK:
+        job = OHLC_JOBS.get(job_id)
+        if not job:
+            return None
+        return dict(job)
+
+
+class JobControlError(RuntimeError):
+    pass
+
+
+class InvalidTokenError(RuntimeError):
+    pass
+
+
 def _add_failure_sample(job_id: str, instrument_key: str, detail: str) -> None:
     with OHLC_JOBS_LOCK:
         job = OHLC_JOBS.get(job_id)
@@ -405,7 +429,178 @@ def _format_fetch_error(exc: Exception) -> str:
         body = exc.response.text
         snippet = body[:200].replace('\n', ' ')
         return f'http_{exc.response.status_code}: {snippet}'
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        body = exc.response.text
+        snippet = body[:200].replace('\n', ' ')
+        return f'http_{exc.response.status_code}: {snippet}'
     return str(exc)
+
+
+def _is_invalid_token_error(exc: Exception) -> bool:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        if exc.response.status_code == 401:
+            body = exc.response.text.upper()
+            return 'INVALID TOKEN' in body or 'UDAPI100050' in body
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        if exc.response.status_code == 401:
+            body = exc.response.text.upper()
+            return 'INVALID TOKEN' in body or 'UDAPI100050' in body
+    text = str(exc).upper()
+    return 'INVALID TOKEN' in text or 'UDAPI100050' in text
+
+
+def _retry_delay_seconds(resp: Optional[requests.Response], attempt: int) -> float:
+    if resp is not None:
+        retry_after = resp.headers.get('Retry-After')
+        if retry_after:
+            try:
+                return max(1.0, float(retry_after))
+            except ValueError:
+                pass
+    base = min(12.0, 1.5 * (2 ** max(0, attempt - 1)))
+    jitter = random.uniform(0.0, 0.75)
+    return base + jitter
+
+
+def _pace_upstox_request() -> None:
+    global LAST_UPSTOX_REQUEST_TS
+    with UPSTOX_REQUEST_LOCK:
+        now = time.time()
+        wait_for = MIN_UPSTOX_REQUEST_GAP_SECONDS - (now - LAST_UPSTOX_REQUEST_TS)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        LAST_UPSTOX_REQUEST_TS = time.time()
+
+
+def _get_async_upstox_request_lock() -> asyncio.Lock:
+    global ASYNC_UPSTOX_REQUEST_LOCK
+    if ASYNC_UPSTOX_REQUEST_LOCK is None:
+        ASYNC_UPSTOX_REQUEST_LOCK = asyncio.Lock()
+    return ASYNC_UPSTOX_REQUEST_LOCK
+
+
+async def _async_pace_upstox_request() -> None:
+    global LAST_UPSTOX_REQUEST_TS
+    lock = _get_async_upstox_request_lock()
+    async with lock:
+        now = time.time()
+        wait_for = MIN_UPSTOX_REQUEST_GAP_SECONDS - (now - LAST_UPSTOX_REQUEST_TS)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        LAST_UPSTOX_REQUEST_TS = time.time()
+
+
+def _job_control_state(job_id: Optional[str]) -> str:
+    if not job_id:
+        return 'running'
+    snapshot = _get_job_snapshot(job_id)
+    if not snapshot:
+        return 'stopped'
+    return str(snapshot.get('control_state') or 'running')
+
+
+def _controlled_sleep(job_id: Optional[str], seconds: float) -> None:
+    remaining = seconds
+    while remaining > 0:
+        state = _job_control_state(job_id)
+        if state == 'stopped':
+            raise JobControlError('Job stopped by user.')
+        if state == 'paused':
+            _update_job(job_id or '', status='paused', message='Paused by user.')
+            time.sleep(0.25)
+            continue
+        step = min(0.25, remaining)
+        time.sleep(step)
+        remaining -= step
+
+
+async def _async_controlled_sleep(job_id: Optional[str], seconds: float) -> None:
+    remaining = seconds
+    while remaining > 0:
+        state = _job_control_state(job_id)
+        if state == 'stopped':
+            raise JobControlError('Job stopped by user.')
+        if state == 'paused':
+            _update_job(job_id or '', status='paused', message='Paused by user.')
+            await asyncio.sleep(0.25)
+            continue
+        step = min(0.25, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+
+
+def _honor_job_control(job_id: Optional[str]) -> None:
+    state = _job_control_state(job_id)
+    if state == 'stopped':
+        raise JobControlError('Job stopped by user.')
+    if state == 'paused':
+        _update_job(job_id or '', status='paused', message='Paused by user.')
+        while _job_control_state(job_id) == 'paused':
+            time.sleep(0.25)
+        if _job_control_state(job_id) == 'stopped':
+            raise JobControlError('Job stopped by user.')
+        _update_job(job_id or '', status='running', message='Resumed. Continuing OHLC fetch...')
+
+
+async def _async_honor_job_control(job_id: Optional[str]) -> None:
+    state = _job_control_state(job_id)
+    if state == 'stopped':
+        raise JobControlError('Job stopped by user.')
+    if state == 'paused':
+        _update_job(job_id or '', status='paused', message='Paused by user.')
+        while _job_control_state(job_id) == 'paused':
+            await asyncio.sleep(0.25)
+        if _job_control_state(job_id) == 'stopped':
+            raise JobControlError('Job stopped by user.')
+        _update_job(job_id or '', status='running', message='Resumed. Continuing OHLC fetch...')
+
+
+def _get_json_with_backoff(
+    url: str,
+    *,
+    headers: Dict[str, str],
+    timeout: int,
+    job_id: Optional[str] = None,
+    max_attempts: int = 6,
+) -> requests.Response:
+    last_response: Optional[requests.Response] = None
+    for attempt in range(1, max_attempts + 1):
+        _honor_job_control(job_id)
+        _pace_upstox_request()
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        last_response = resp
+        if resp.status_code != 429:
+            return resp
+        delay = _retry_delay_seconds(resp, attempt)
+        logger.warning('Rate limited by Upstox for %s on attempt %s/%s. Sleeping %.2fs.', url, attempt, max_attempts, delay)
+        _controlled_sleep(job_id, delay)
+    assert last_response is not None
+    return last_response
+
+
+async def _async_get_json_with_backoff(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: Dict[str, str],
+    timeout: int,
+    params: Optional[Dict[str, str]] = None,
+    job_id: Optional[str] = None,
+    max_attempts: int = 6,
+) -> httpx.Response:
+    last_response: Optional[httpx.Response] = None
+    for attempt in range(1, max_attempts + 1):
+        await _async_honor_job_control(job_id)
+        await _async_pace_upstox_request()
+        resp = await client.get(url, headers=headers, params=params, timeout=timeout)
+        last_response = resp
+        if resp.status_code != 429:
+            return resp
+        delay = _retry_delay_seconds(resp, attempt)
+        logger.warning('Rate limited by Upstox for %s on attempt %s/%s. Sleeping %.2fs.', url, attempt, max_attempts, delay)
+        await _async_controlled_sleep(job_id, delay)
+    assert last_response is not None
+    return last_response
 
 
 def _fetch_expired_candle_with_meta(
@@ -414,9 +609,10 @@ def _fetch_expired_candle_with_meta(
     interval: str,
     from_date: str,
     to_date: str,
+    job_id: Optional[str] = None,
 ) -> Tuple[List[List[object]], int, str, str]:
     url = f'{UPSTOX_BASE}/v2/expired-instruments/historical-candle/{expired_instrument_key}/{interval}/{to_date}/{from_date}'
-    resp = requests.get(
+    resp = _get_json_with_backoff(
         url,
         headers={
             'Authorization': f'Bearer {access_token}',
@@ -424,6 +620,84 @@ def _fetch_expired_candle_with_meta(
             'Content-Type': 'application/json',
         },
         timeout=20,
+        job_id=job_id,
+    )
+    status_code = resp.status_code
+    body_text = resp.text
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if status_code != 200:
+        resp.raise_for_status()
+    candles: List[List[object]] = []
+    if isinstance(payload, dict):
+        candles = payload.get('data', {}).get('candles', []) or []
+        body_text = json.dumps(payload, ensure_ascii=False)
+    return candles, status_code, url, body_text
+
+
+async def _fetch_expired_contracts_for_expiry_async(
+    client: httpx.AsyncClient,
+    access_token: str,
+    underlying_key: str,
+    expiry_date: str,
+    job_id: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    }
+    options_url = f'{UPSTOX_BASE}/v2/expired-instruments/option/contract'
+    futures_url = f'{UPSTOX_BASE}/v2/expired-instruments/future/contract'
+    contracts: List[Dict[str, str]] = []
+    for url in (options_url, futures_url):
+        resp = await _async_get_json_with_backoff(
+            client,
+            url,
+            headers=headers,
+            params={'instrument_key': underlying_key, 'expiry_date': expiry_date},
+            timeout=20,
+            job_id=job_id,
+        )
+        if resp.status_code != 200:
+            continue
+        data = resp.json().get('data', []) or []
+        for item in data:
+            contracts.append(
+                {
+                    'instrument_key': str(item.get('instrument_key') or ''),
+                    'trading_symbol': str(item.get('trading_symbol') or ''),
+                    'instrument_type': str(item.get('instrument_type') or ''),
+                    'strike_price': str(item.get('strike_price') or ''),
+                    'expiry': str(item.get('expiry') or expiry_date),
+                    'segment': str(item.get('segment') or ''),
+                }
+            )
+    return contracts
+
+
+async def _fetch_expired_candle_with_meta_async(
+    client: httpx.AsyncClient,
+    access_token: str,
+    expired_instrument_key: str,
+    interval: str,
+    from_date: str,
+    to_date: str,
+    job_id: Optional[str] = None,
+) -> Tuple[List[List[object]], int, str, str]:
+    url = f'{UPSTOX_BASE}/v2/expired-instruments/historical-candle/{expired_instrument_key}/{interval}/{to_date}/{from_date}'
+    resp = await _async_get_json_with_backoff(
+        client,
+        url,
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        },
+        timeout=20,
+        job_id=job_id,
     )
     status_code = resp.status_code
     body_text = resp.text
@@ -458,10 +732,11 @@ def _fetch_spot_candle_with_meta(
     interval: str,
     from_date: str,
     to_date: str,
+    job_id: Optional[str] = None,
 ) -> Tuple[List[List[object]], int, str, str]:
     interval_path = _spot_interval_path(interval)
     url = f'{UPSTOX_BASE}/v3/historical-candle/{instrument_key}/{interval_path}/{to_date}/{from_date}'
-    resp = requests.get(
+    resp = _get_json_with_backoff(
         url,
         headers={
             'Authorization': f'Bearer {access_token}',
@@ -469,6 +744,44 @@ def _fetch_spot_candle_with_meta(
             'Content-Type': 'application/json',
         },
         timeout=20,
+        job_id=job_id,
+    )
+    status_code = resp.status_code
+    body_text = resp.text
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if status_code != 200:
+        resp.raise_for_status()
+    candles: List[List[object]] = []
+    if isinstance(payload, dict):
+        candles = payload.get('data', {}).get('candles', []) or []
+        body_text = json.dumps(payload, ensure_ascii=False)
+    return candles, status_code, url, body_text
+
+
+async def _fetch_spot_candle_with_meta_async(
+    client: httpx.AsyncClient,
+    access_token: str,
+    instrument_key: str,
+    interval: str,
+    from_date: str,
+    to_date: str,
+    job_id: Optional[str] = None,
+) -> Tuple[List[List[object]], int, str, str]:
+    interval_path = _spot_interval_path(interval)
+    url = f'{UPSTOX_BASE}/v3/historical-candle/{instrument_key}/{interval_path}/{to_date}/{from_date}'
+    resp = await _async_get_json_with_backoff(
+        client,
+        url,
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        },
+        timeout=20,
+        job_id=job_id,
     )
     status_code = resp.status_code
     body_text = resp.text
@@ -491,6 +804,7 @@ def _fetch_spot_candles_range(
     interval: str,
     from_date: str,
     to_date: str,
+    job_id: Optional[str] = None,
 ) -> Tuple[List[List[object]], int, str, str]:
     start_dt = _parse_date(from_date)
     end_dt = _parse_date(to_date)
@@ -512,6 +826,46 @@ def _fetch_spot_candles_range(
             interval,
             chunk_from,
             chunk_to,
+            job_id=job_id,
+        )
+        if not data:
+            return [], status_code, last_url, last_body
+        candles.extend(data)
+        current = chunk_end + timedelta(days=1)
+    return candles, status_code, last_url, last_body
+
+
+async def _fetch_spot_candles_range_async(
+    client: httpx.AsyncClient,
+    access_token: str,
+    instrument_key: str,
+    interval: str,
+    from_date: str,
+    to_date: str,
+    job_id: Optional[str] = None,
+) -> Tuple[List[List[object]], int, str, str]:
+    start_dt = _parse_date(from_date)
+    end_dt = _parse_date(to_date)
+    if start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+    candles: List[List[object]] = []
+    status_code = 200
+    last_url = ''
+    last_body = ''
+    chunk_days = 25
+    current = start_dt
+    while current <= end_dt:
+        chunk_end = min(current + timedelta(days=chunk_days), end_dt)
+        chunk_from = _format_date(current)
+        chunk_to = _format_date(chunk_end)
+        data, status_code, last_url, last_body = await _fetch_spot_candle_with_meta_async(
+            client,
+            access_token,
+            instrument_key,
+            interval,
+            chunk_from,
+            chunk_to,
+            job_id=job_id,
         )
         if not data:
             return [], status_code, last_url, last_body
@@ -531,7 +885,7 @@ def _tail_log(path: Path, limit: int = 200) -> List[str]:
     return lines[-limit:]
 
 
-def _run_ohlc_job(
+async def _run_ohlc_job(
     job_id: str,
     access_token: str,
     underlying_key: str,
@@ -539,11 +893,13 @@ def _run_ohlc_job(
     from_date: str,
     to_date: str,
     include_spot: bool,
+    include_futures: bool,
+    include_options: bool,
 ) -> None:
     try:
         snapshot = _load_snapshot(underlying_key)
         if not snapshot:
-            collect_expired_contracts(access_token, underlyings=[underlying_key], max_expiries=120)
+            await asyncio.to_thread(collect_expired_contracts, access_token, underlyings=[underlying_key], max_expiries=120)
             snapshot = _load_snapshot(underlying_key)
         if not snapshot:
             _update_job(job_id, status='error', message='Snapshot not found for underlying.')
@@ -555,15 +911,37 @@ def _run_ohlc_job(
             return
 
         contracts: Dict[str, Dict[str, str]] = {}
-        for expiry in expiries:
-            for contract in _fetch_expired_contracts_for_expiry(access_token, underlying_key, expiry):
-                instrument_type = contract.get('instrument_type', '').upper()
-                if instrument_type.startswith('FUT'):
-                    instrument_type = 'FUT'
-                    contract['instrument_type'] = 'FUT'
-                if instrument_type not in {'CE', 'PE', 'FUT'}:
-                    continue
-                contracts[contract['instrument_key']] = contract
+        async with httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=max(OHLC_FETCH_MAX_WORKERS + OHLC_EXPIRY_DISCOVERY_MAX_CONCURRENCY + 2, 6)),
+            follow_redirects=True,
+        ) as client:
+            expiry_semaphore = asyncio.Semaphore(OHLC_EXPIRY_DISCOVERY_MAX_CONCURRENCY)
+
+            async def _fetch_contracts_for_expiry(expiry: str) -> List[Dict[str, str]]:
+                async with expiry_semaphore:
+                    await _async_honor_job_control(job_id)
+                    return await _fetch_expired_contracts_for_expiry_async(
+                        client,
+                        access_token,
+                        underlying_key,
+                        expiry,
+                        job_id=job_id,
+                    )
+
+            expiry_tasks = [asyncio.create_task(_fetch_contracts_for_expiry(expiry)) for expiry in expiries]
+            for task in asyncio.as_completed(expiry_tasks):
+                for contract in await task:
+                    instrument_type = contract.get('instrument_type', '').upper()
+                    if instrument_type.startswith('FUT'):
+                        instrument_type = 'FUT'
+                        contract['instrument_type'] = 'FUT'
+                    if instrument_type in {'CE', 'PE'} and not include_options:
+                        continue
+                    if instrument_type == 'FUT' and not include_futures:
+                        continue
+                    if instrument_type not in {'CE', 'PE', 'FUT'}:
+                        continue
+                    contracts[contract['instrument_key']] = contract
         if include_spot:
             contracts[underlying_key] = {
                 'instrument_key': underlying_key,
@@ -590,6 +968,8 @@ def _run_ohlc_job(
                         'from_date': from_date,
                         'to_date': to_date,
                         'include_spot': include_spot,
+                        'include_futures': include_futures,
+                        'include_options': include_options,
                     },
                     ensure_ascii=False,
                 ),
@@ -600,6 +980,7 @@ def _run_ohlc_job(
         job_parquet_path = job_output_dir / 'ohlc_job.parquet'
         writer: Optional[pq.ParquetWriter] = None
         index_entries: List[Dict[str, object]] = []
+        empty_index_entries: List[Dict[str, object]] = []
         _update_job(
             job_id,
             total=total,
@@ -610,46 +991,6 @@ def _run_ohlc_job(
             job_db_path=str(job_output_dir),
             job_parquet_path=str(job_parquet_path),
         )
-
-        def _fetch_one(
-            key: str,
-            instrument_type: str,
-            range_from: str,
-            range_to: str,
-        ) -> Tuple[str, Optional[List[List[object]]], str, str, str]:
-            data = None
-            last_error: Optional[Exception] = None
-            for _ in range(3):
-                try:
-                    if instrument_type == 'SPOT':
-                        candles, status_code, url, body = _fetch_spot_candles_range(
-                            access_token,
-                            key,
-                            interval,
-                            range_from,
-                            range_to,
-                        )
-                    else:
-                        candles, status_code, url, body = _fetch_expired_candle_with_meta(
-                            access_token,
-                            key,
-                            interval,
-                            range_from,
-                            range_to,
-                        )
-                    data = candles
-                    if data:
-                        break
-                    last_error = RuntimeError(
-                        f'empty_candles: status={status_code} url={url} body={body}'
-                    )
-                except Exception as exc:
-                    last_error = exc
-                time.sleep(0.5)
-            if not data:
-                detail = _format_fetch_error(last_error) if last_error else 'unknown_error'
-                return key, None, detail, range_from, range_to
-            return key, data, '', range_from, range_to
 
         keys_to_fetch: List[Tuple[str, str, str, str]] = []
         skipped = 0
@@ -689,22 +1030,86 @@ def _run_ohlc_job(
         if skipped:
             _update_job(job_id, skipped_instruments=skipped, completed=skipped)
 
-        max_workers = min(4, len(keys_to_fetch)) if keys_to_fetch else 0
+        max_workers = min(OHLC_FETCH_MAX_WORKERS, len(keys_to_fetch)) if keys_to_fetch else 0
         if max_workers == 0:
             _update_job(job_id, status='completed', message='Nothing new to store.')
             return
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(_fetch_one, key, instrument_type, range_from, range_to): (key, range_from, range_to)
+        async with httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=max(OHLC_FETCH_MAX_WORKERS + 2, 4)),
+            follow_redirects=True,
+        ) as client:
+            async def _fetch_one(
+                key: str,
+                instrument_type: str,
+                range_from: str,
+                range_to: str,
+            ) -> Tuple[str, Optional[List[List[object]]], str, str, str]:
+                data = None
+                last_error: Optional[Exception] = None
+                for _ in range(3):
+                    try:
+                        await _async_honor_job_control(job_id)
+                        if instrument_type == 'SPOT':
+                            candles, status_code, url, body = await _fetch_spot_candles_range_async(
+                                client,
+                                access_token,
+                                key,
+                                interval,
+                                range_from,
+                                range_to,
+                                job_id=job_id,
+                            )
+                        else:
+                            candles, status_code, url, body = await _fetch_expired_candle_with_meta_async(
+                                client,
+                                access_token,
+                                key,
+                                interval,
+                                range_from,
+                                range_to,
+                                job_id=job_id,
+                            )
+                        data = candles
+                        if data:
+                            break
+                        last_error = RuntimeError(
+                            f'empty_candles: status={status_code} url={url} body={body}'
+                        )
+                    except Exception as exc:
+                        if _is_invalid_token_error(exc):
+                            raise InvalidTokenError('Upstox token expired or became invalid during OHLC fetch.')
+                        last_error = exc
+                    await _async_controlled_sleep(job_id, 1.5)
+                if not data:
+                    detail = _format_fetch_error(last_error) if last_error else 'unknown_error'
+                    return key, None, detail, range_from, range_to
+                return key, data, '', range_from, range_to
+
+            fetch_semaphore = asyncio.Semaphore(max_workers)
+
+            async def _fetch_with_semaphore(
+                key: str,
+                instrument_type: str,
+                range_from: str,
+                range_to: str,
+            ) -> Tuple[str, Optional[List[List[object]]], str, str, str]:
+                async with fetch_semaphore:
+                    return await _fetch_one(key, instrument_type, range_from, range_to)
+
+            fetch_tasks = {
+                asyncio.create_task(_fetch_with_semaphore(key, instrument_type, range_from, range_to)): (key, range_from, range_to)
                 for key, instrument_type, range_from, range_to in keys_to_fetch
             }
-            for future in as_completed(future_map):
-                instrument_key, range_from, range_to = future_map[future]
+            for task in asyncio.as_completed(fetch_tasks):
+                instrument_key, range_from, range_to = fetch_tasks[task]
                 error_detail = ''
                 data: Optional[List[List[object]]] = None
                 try:
-                    instrument_key, data, error_detail, range_from, range_to = future.result()
+                    instrument_key, data, error_detail, range_from, range_to = await task
+                except InvalidTokenError as exc:
+                    _update_job(job_id, status='error', message=str(exc), control_state='stopped')
+                    return
                 except Exception as exc:
                     logger.exception('OHLC worker crashed: %s', exc)
                     error_detail = _format_exception(exc)
@@ -712,6 +1117,7 @@ def _run_ohlc_job(
                 stored = 0
                 failed = False
                 if data:
+                    error_detail = ''
                     try:
                         table = _build_parquet_table(
                             instrument_key,
@@ -733,16 +1139,29 @@ def _run_ohlc_job(
                         error_detail = _format_exception(exc)
                 else:
                     failed = True
+                    if error_detail.startswith('empty_candles:'):
+                        empty_index_entries.append(
+                            _make_index_entry(
+                                instrument_key,
+                                underlying_key,
+                                interval,
+                                range_from,
+                                range_to,
+                                0,
+                                status='empty',
+                            )
+                        )
+                        failed = False
                 if stored:
                     index_entries.append(
-                        {
-                            'instrument_key': instrument_key,
-                            'underlying_key': underlying_key,
-                            'interval': interval,
-                            'from_date': range_from,
-                            'to_date': range_to,
-                            'rows': stored,
-                        }
+                        _make_index_entry(
+                            instrument_key,
+                            underlying_key,
+                            interval,
+                            range_from,
+                            range_to,
+                            stored,
+                        )
                     )
 
                 with OHLC_JOBS_LOCK:
@@ -763,6 +1182,7 @@ def _run_ohlc_job(
         try:
             merged = _append_master_parquet(job_parquet_path)
             _append_index_entries(index_entries)
+            _append_index_entries(empty_index_entries)
             _update_job(
                 job_id,
                 status='completed',
@@ -781,6 +1201,10 @@ def _run_ohlc_job(
                 writer.close()
             except Exception:
                 pass
+        if isinstance(exc, JobControlError):
+            logger.info('OHLC job %s stopped/paused control exit: %s', job_id, exc)
+            _update_job(job_id, status='stopped', message=str(exc))
+            return
         logger.exception('OHLC job failed: %s', exc)
         _update_job(job_id, status='error', message=f'Job failed: {exc}')
 
@@ -944,6 +1368,26 @@ def _max_index_to_date(instrument_key: str, interval: str) -> Optional[date]:
     return max_dt
 
 
+def _make_index_entry(
+    instrument_key: str,
+    underlying_key: str,
+    interval: str,
+    from_date: str,
+    to_date: str,
+    rows: int,
+    status: str = 'stored',
+) -> Dict[str, object]:
+    return {
+        'instrument_key': instrument_key,
+        'underlying_key': underlying_key,
+        'interval': interval,
+        'from_date': from_date,
+        'to_date': to_date,
+        'rows': rows,
+        'status': status,
+    }
+
+
 def _append_master_parquet(job_parquet_path: Path) -> int:
     _ensure_storage_dirs()
     if not job_parquet_path.exists():
@@ -956,7 +1400,9 @@ def _append_master_parquet(job_parquet_path: Path) -> int:
         combined = pa.concat_tables([master_table, job_table])
     else:
         combined = job_table
-    pq.write_table(combined, MASTER_CANDLES_PARQUET)
+    temp_path = MASTER_CANDLES_PARQUET.with_suffix(f'{MASTER_CANDLES_PARQUET.suffix}.tmp')
+    pq.write_table(combined, temp_path)
+    temp_path.replace(MASTER_CANDLES_PARQUET)
     return int(job_table.num_rows)
 
 
@@ -973,6 +1419,7 @@ def _append_index_entries(entries: List[Dict[str, object]]) -> None:
             'from_date': [entry['from_date'] for entry in entries],
             'to_date': [entry['to_date'] for entry in entries],
             'rows': [entry['rows'] for entry in entries],
+            'status': [str(entry.get('status') or 'stored') for entry in entries],
             'updated_at': [now for _ in entries],
         }
     )
@@ -983,10 +1430,17 @@ def _append_index_entries(entries: List[Dict[str, object]]) -> None:
                 'underlying_key',
                 pa.array(['' for _ in range(existing.num_rows)]),
             )
+        if 'status' not in existing.column_names:
+            existing = existing.append_column(
+                'status',
+                pa.array(['stored' for _ in range(existing.num_rows)]),
+            )
         combined = pa.concat_tables([existing, new_table], promote=True)
     else:
         combined = new_table
-    pq.write_table(combined, MASTER_INDEX_PARQUET)
+    temp_path = MASTER_INDEX_PARQUET.with_suffix(f'{MASTER_INDEX_PARQUET.suffix}.tmp')
+    pq.write_table(combined, temp_path)
+    temp_path.replace(MASTER_INDEX_PARQUET)
 
 
 def _index_entries_from_job_parquet(
@@ -1008,16 +1462,7 @@ def _index_entries_from_job_parquet(
         counts[key] = counts.get(key, 0) + 1
     entries: List[Dict[str, object]] = []
     for (instrument_key, interval, from_date, to_date), rows in counts.items():
-        entries.append(
-            {
-                'instrument_key': instrument_key,
-                'underlying_key': underlying_key or '',
-                'interval': interval,
-                'from_date': from_date,
-                'to_date': to_date,
-                'rows': rows,
-            }
-        )
+        entries.append(_make_index_entry(instrument_key, underlying_key or '', interval, from_date, to_date, rows))
     return entries
 
 
@@ -1374,6 +1819,8 @@ def store_expired_candles(
     from_date: str = Query(...),
     to_date: str = Query(...),
     include_spot: bool = Query(True),
+    include_futures: bool = Query(True),
+    include_options: bool = Query(True),
 ):
     token = _normalize_access_token()
     if not token:
@@ -1382,6 +1829,7 @@ def store_expired_candles(
     with OHLC_JOBS_LOCK:
         OHLC_JOBS[job_id] = {
             'status': 'running',
+            'control_state': 'running',
             'message': 'Starting job...',
             'total': 0,
             'completed': 0,
@@ -1400,6 +1848,8 @@ def store_expired_candles(
         from_date,
         to_date,
         include_spot,
+        include_futures,
+        include_options,
     )
     return JSONResponse({'status': 'started', 'job_id': job_id})
 
@@ -1411,6 +1861,31 @@ def get_ohlc_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail='Job not found.')
     return JSONResponse(job)
+
+
+@app.post('/api/ohlc-job/{job_id}/control')
+def control_ohlc_job(job_id: str, action: str = Query(...)):
+    with OHLC_JOBS_LOCK:
+        job = OHLC_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail='Job not found.')
+        current_status = str(job.get('status') or 'running')
+        if current_status in {'completed', 'error', 'stopped'}:
+            return JSONResponse(job)
+        if action == 'pause':
+            job['control_state'] = 'paused'
+            job['status'] = 'paused'
+            job['message'] = 'Paused by user.'
+        elif action == 'resume':
+            job['control_state'] = 'running'
+            job['status'] = 'running'
+            job['message'] = 'Resumed. Continuing OHLC fetch...'
+        elif action == 'stop':
+            job['control_state'] = 'stopped'
+            job['message'] = 'Stop requested by user.'
+        else:
+            raise HTTPException(status_code=400, detail='Unsupported action.')
+        return JSONResponse(job)
 
 
 @app.get('/api/ohlc-log')
