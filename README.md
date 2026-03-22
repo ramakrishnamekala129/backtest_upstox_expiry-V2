@@ -1,4 +1,4 @@
-# Backtest Upstox Expiry V2
+# Backtest Upstox Expiry V3
 
 FastAPI and React application for collecting Upstox expired derivatives data, storing OHLC history locally, and exploring the resulting cache through a browser UI.
 
@@ -10,6 +10,25 @@ FastAPI and React application for collecting Upstox expired derivatives data, st
 - Exposes APIs for search, download, job control, token status, and cached candle queries
 - Serves a React frontend for snapshot collection, OHLC jobs, and range browsing
 - Includes a separate backtest engine for option strategies in `upstox_tools/backtest.py`
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+cd frontend && npm ci && npm run build && cd ..
+
+# Configure environment
+copy .env.example .env
+# Edit .env with your Upstox credentials
+
+# Run the application
+python web_app.py --host 127.0.0.1 --port 8765
+```
+
+Open http://127.0.0.1:8765/ in your browser.
+
+For detailed setup instructions, see [Getting Started Guide](docs/GETTING_STARTED.md).
 
 ## Repository Layout
 
@@ -181,7 +200,29 @@ Full details: [docs/API.md](/d:/backtest_upstox_expiry%20V2/docs/API.md)
 - The app rate-limits Upstox requests internally and persists job state in memory while writing data to disk.
 - Existing WAL cleanup for the DuckDB file happens during startup.
 
-## Additional Documentation
+## Documentation
 
-- [API reference](/d:/backtest_upstox_expiry%20V2/docs/API.md)
-- [Architecture and storage](/d:/backtest_upstox_expiry%20V2/docs/ARCHITECTURE.md)
+Complete documentation is available in the [`docs/`](docs/) directory:
+
+- **[Getting Started Guide](docs/GETTING_STARTED.md)** - Setup and installation instructions
+- **[User Guide](docs/USER_GUIDE.md)** - Feature walkthrough and usage instructions
+- **[API Reference](docs/API.md)** - Complete API endpoint documentation
+- **[Architecture](docs/ARCHITECTURE.md)** - System design and storage overview
+- **[Deployment Guide](docs/DEPLOYMENT.md)** - Production deployment instructions
+- **[Developer Guide](docs/DEVELOPER_GUIDE.md)** - Development setup and contributing guidelines
+
+## License
+
+This project is for educational and personal use. Please review Upstox API terms of service before use.
+
+## Disclaimer
+
+This is a personal project and is not affiliated with or endorsed by Upstox. Trading in financial markets involves risk. Use at your own discretion.
+
+## Support
+
+For issues or questions:
+
+1. Check the [Documentation](#documentation)
+2. Review [Troubleshooting](docs/GETTING_STARTED.md#troubleshooting)
+3. Examine logs in `data/ohlc_errors.log`
